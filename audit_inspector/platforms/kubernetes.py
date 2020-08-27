@@ -5,17 +5,20 @@ import re
 from plucky import pluck, plucks, pluckable, merge # TODO remove the specific imports not needed
 from audit_inspector.common import functions
 from dateutil import parser
+import simplejson as json
+import ipaddress
+from collections import abc
 
 
 class kubernetes():
-    
+
     def __init__(self, text):
-        
+
         # TEXT PROCESSING VARIABLES
         ###############################################################################################################
         section_regxp = re.compile(r'(?<=\+\s)?(?P<command>.*)\n(?P<output>[\s\S]*?)\+\s')
         command_regx = re.search(section_regxp, text).group('command')
-        output_regx = re.search(section_regxp, text).group('output')
+        output_regx = re.search(section_regxp, text).group('output').replace('\n\n', '\n')
         ###############################################################################################################
 
         # EVIDENCE VARIABLES
@@ -26,25 +29,24 @@ class kubernetes():
         connectionDetails = {}
         connectionDetails['Available Ciphers'] = []
         ###############################################################################################################
-        
         for section in re.finditer(section_regxp, text):
             if 'date' in section.group('command'):
                 date = functions.get_evidence_date(section.group('output'))
-            
+
             if 'config view' in section.group('command'):
                 for line in section.group('output').split('\n'):
-                    if 'server:' in line: 
+                    if 'server:' in line:
                         hostname = line.split()[1]
 
             if 'get pods' in section.group('command'):
                 def get_pod_info():
                     """
                     Collect and return Kubernetes pod information as a list of dictionaries with the following information:
-                    {<POD_NAME>:, <NAMESPACE>:, <LABELS>:, <IMAGE>:, <RESOURCE_LIMITS>:}
+                    {<POD_NAME>:, <NAMESPACE>:, <LABELS>:} Likely to add <IMAGE>:, <RESOURCE_LIMITS>:
                     Kubernetes returns a very complicated json object with nested dictionaries, lists, etc. So Plucky
                     is used to simplify data retrieval.
                     """
-                    pods = []
+                    pod_info = []
                     for entry in functions.section_text_to_json(section):
                         d = {}
                         # <POD_NAME>
@@ -55,7 +57,7 @@ class kubernetes():
                         labels = []
                         if plucks(entry, 'metadata.labels'):
                             for label in functions.traverse(plucks(entry, 'metadata.labels')):
-                                labels.append(label)
+                                labels.append(f"{label[0]}={label[1]}")
                         else:
                             labels.append('!')
                         d['labels'] = labels
@@ -70,82 +72,80 @@ class kubernetes():
                         else:
                             limits = '*:*'
                         d['limits'] = limits
-                        pods.append(d)
-                    return pods
+                        pod_info.append(d)
+                    return pod_info
 
                 self.pods = get_pod_info()
 
             if 'get networkpolicy' in section.group('command'):
                 def getFirewallInfo():
                     """
-                    Collect and return Kubernetes Network Policy object information as a list of dictionaries with the
-                    following information:
-                    {<ACL_NAME>:, <INTERFACE>:, <INGRESS_FROM/EGRESS_TO>:, <PORTS>:}
-                    Kubernetes returns a very complicated json object with nested dictionaries, lists, etc. So Plucky
-                    is used to simplify data retrieval.
+                    Collect and return Kubernetes Network Policy object information as a list of dictionaries.
+
+                    Inputs: kubectl get networkpolicy -A -o json
+
+                    Returns: {<NAME>:, <NAMESPACE>:, <ACTION>:, <SOURCE>:, <DEST>:, <PROTOCOL>:, <PORT>}
                     """
-                    firewall = []
+                    firewall_rules = [] # list to hold dictionaries of test results
                     for entry in functions.section_text_to_json(section):
-                        d = {}
-                        # <ACL_NAME>
-                        d['aclName'] = plucks(entry, 'metadata.name')
-                        # <INTERFACE>
-                        pod_selector = []
-                        if plucks(entry, 'spec.podSelector.matchLabels'): # There is always some kind of pod selector
-                            for k,v in plucks(entry, 'spec.podSelector.matchLabels').items():
-                                pod_selector.append(f"LABEL:{k}={v}")
-                        else: # Empty podSelector selects all pods in namespace
-                            pod_selector.append(f"NAMESPACE:{plucks(entry, 'metadata.namespace')}")
-                        d['interface'] = pod_selector
-                        # <INGRESS_FROM>
+                        # TODO figure out how to level this so I can use a common function in each if/else block
+                        # If spec.ingress exists then the pod selector is the destination and the spec.ingress is the source
+                        def build_acl_dict(entry, action, direction):
+                            results = {}
+
+                            # <ACL_NAME>
+                            results.update({'name': plucks(entry, 'metadata.name')})
+                            # <NAMESPACE>
+                            results.update({'namespace': plucks(entry, 'metadata.namespace')})
+                            # <ACTION>
+                            results.update({'action': action})
+                            # <PORTS>
+                            ports = []
+                            protocols = []
+                            if plucks(entry, f"spec.{direction}.ports"):
+                                for i in functions.traverse(plucks(entry, f"spec.{direction}.ports")):
+                                    if 'protocol' in i:
+                                        protocols.append(f"{i[1]}")
+                                    if 'port' in i:
+                                        ports.append(f"{i[1]}")
+                            if ports:
+                                results.update({'ports': ports})
+                                results.update({'protocols': protocols})
+                            if not ports:
+                                results.update({'ports': '*'})
+                                results.update({'protocols': '*'})
+                            # <SOURCE>
+                            if direction == 'ingress':
+                                results.update({'source': k8s_selectors(plucks(entry, 'spec.ingress.from'))})
+                                # <DESTINATION>
+                                if plucks(entry, 'spec.podSelector'): # an empty pod selector allows all in the NS
+                                    results.update({'destination': k8s_selectors(plucks(entry, 'spec.podSelector'))})
+                                else:
+                                    results.update({'destination': '*'})
+                            if direction == 'egress':
+                                # <SOURCE>
+                                if plucks(entry, 'spec.podSelector'): # an empty pod selector allows all in the NS
+                                    results.update({'source': k8s_selectors(plucks(entry, 'spec.podSelector'))})
+                                else:
+                                    results.update({'source': '*'})
+                                # <DESTINATION>
+                                results.update({'destination': k8s_selectors(plucks(entry, 'spec.egress.to'))})
+                            return results
+
                         if 'Ingress' in plucks(entry, 'spec.policyTypes'):
-                            ingress_from = []
-                            if plucks(entry, 'spec.ingress.from'):
-                                for ingress in functions.traverse(plucks(entry, 'spec.ingress.from')):
-                                    # TODO figure out a cleaner way to add an IP and except in the same list item
-                                    # TODO create a separate dict entry for ports rather than attached to the ingress/egress
-                                    cidr = ''
-                                    less = ''
-                                    if 'cidr' in ingress:
-                                        cidr = ingress
-                                    if 'except' in ingress:
-                                        less = ingress.split('=')[1]
-                                        ingress_from.append(f'{cidr}:less{less}')
-                                    if plucks(entry, 'spec.ingress.ports'):
-                                        port, protocol = '', ''
-                                        for ports in functions.traverse(plucks(entry, 'spec.ingress.ports')):
-                                            if 'port' in ports:
-                                                port = ports.split('=')[1]
-                                            elif 'protocol' in ports:
-                                                protocol = ports.split('=')[1]
-                                        ingress_from.append(f'{ingress}:{protocol}{port}')
-                                    else: # if no ports are specified, all ports are allowed
-                                        ingress_from.append(f'{ingress}:*')
-                            else: # If spec.ingress is empty no traffic is allowed
-                                ingress_from.append('!')
-                            d['ingress_from'] = ingress_from
-                        # <EGRESS_TO>
-                        if 'Egress' in (plucks(entry, 'spec.policyTypes')):
-                            egress_to = []
-                            if (plucks(entry, 'spec.egress.to')):
-                                for egress in functions.traverse(plucks(entry, 'spec.egress.to')):
-                                    if plucks(entry, 'spec.egress.ports'):
-                                        port, protocol = '', ''
-                                        for ports in functions.traverse(plucks(entry, 'spec.egress.ports')):
-                                            for ports in functions.traverse(plucks(entry, 'spec.egress.ports')):
-                                                if 'port' in ports:
-                                                    port = ports.split('=')[1]
-                                                elif 'protocol' in ports:
-                                                    protocol = ports.split('=')[1]
-                                        egress_to.append(f'{egress}:{protocol}{port}')
-                                    else: # if no ports are specified, all ports are allowed
-                                        egress_to.append(f'{egress}:*')
-                            else: # If spec.egress is empty no traffic is allowed
-                                egress_to.append(f'!')
-                            d['egress_to'] = egress_to
-                        firewall.append(d)
-                    return firewall
-                                               
+                            if plucks(entry, 'spec.ingress'): # allow
+                                firewall_rules.append(build_acl_dict(entry, 'allow', 'ingress'))
+                            else: # If spec.ingress is missing then no traffic is allowed to the podSelector target
+                                firewall_rules.append(build_acl_dict(entry, 'deny', 'ingress'))
+
+                        # If spec.egress exists then the pod selector is the source and the spec.egress is the destination
+                        if 'Egress' in plucks(entry, 'spec.policyTypes'):
+                            if plucks(entry, 'spec.egress'): # allow
+                                firewall_rules.append(build_acl_dict(entry, 'allow', 'egress'))
+                            else: # empty or missing egress target blocks all egress traffic
+                                firewall_rules.append(build_acl_dict(entry, 'deny', 'egress'))
+                    return firewall_rules
+
                 self.firewall = getFirewallInfo()
 
             if 'get service' in section.group('command'):
@@ -170,7 +170,7 @@ class kubernetes():
                         labels = []
                         if plucks(entry, 'spec.selector'):
                             for label in functions.traverse(plucks(entry, 'spec.selector')):
-                                labels.append(label)
+                                labels.append(f"{label[0]}={label[1]}")
                         else:
                             labels.append('!*=!*')
                         service_info[service_name]['labels'] = labels
@@ -199,15 +199,69 @@ class kubernetes():
                         labels = []
                         if plucks(entry, 'metadata.labels'):
                             for label in functions.traverse(plucks(entry, 'metadata.labels')):
-                                labels.append(label)
+                                labels.append(f"{label[0]}={label[1]}")
                         else:
                             labels.append('!*=!*')
                         namespace_info[namespace_name]['labels'] = labels
                     return namespace_info
                 self.namespaces = get_namespaces()
-            
+
             # Process OpenSSL s_client output
             ###############################################################################################################
-            if 'openssl s_client' in section.group('command'):               
+            if 'openssl s_client' in section.group('command'):
                 connectionDetails.update(functions.process_openssl_output(connectionDetails, platform, date, section.group('output'), section.group('command')))
         self.connectionDetails = connectionDetails
+
+def k8s_selectors(json):
+    """
+    Options for ingresses include CIDR/except, labels, and namespace. This function checks for all
+    of those and returns the results.
+
+    Returns: List of the results with possible formats CIDR:<value>, LABEL:<value>, NAMESPACE:<value>
+    """
+    # TODO figure out how to fold this into functions.traverse. Need a way to notate whether its a namespace Selector, podselector, cidr, etc.
+    selectors = [] # there may be multiple ingress options so hold them here
+    if json:
+        # The JSON is usually a nested dict in a list so this section iterates through that to get to the data.
+        ###############################################################################################################
+        if isinstance(json, list):
+            for item in itertools.chain.from_iterable(json):
+                if isinstance(item, dict):
+                    for key in item:
+        ###############################################################################################################
+                        # TODO there is no port search in here. figure out how to return open ports
+                        if 'ipBlock' == key: # CIDR selector
+                            cidr = ''
+                            less = ''
+                            for value in functions.traverse(item[key]):
+                                if 'cidr' in value:
+                                    cidr = ipaddress.IPv4Network(value[1])
+                                if 'except' in value: # CIDR minus exception
+                                    less = [ipaddress.IPv4Network(item) for item in value[1]]
+
+
+                            if less:
+                                # Remove the exception subnets from the supernet and return a set of the results.
+                                ###################################################################################
+                                resultant_cidrs = []
+                                for item in less:
+                                    resultant_cidrs.extend(list(cidr.address_exclude(item)))
+
+                                for i in set(resultant_cidrs):
+                                    selectors.append('CIDR:' + str(i))
+                                ###################################################################################
+                            else:
+                                selectors.append('CIDR:' + str(cidr))
+                        if 'namespaceSelector' == key: # namespace label selector
+                            for value in functions.traverse(item[key]):
+                                selectors.append(f"NSLABEL:{value[0]}={value[1]}")
+                        if 'podSelector' == key:
+                            for value in functions.traverse(item[key]):
+                                selectors.append(f"PODLABEL:{value[0]}={value[1]}")
+        elif isinstance(json, abc.Mapping): # Only podSelectors will be in this format and always use matchLabel
+            for key in json:
+                for value in functions.traverse(json[key]):
+                    selectors.append(f"PODLABEL:{value[0]}={value[1]}")
+    else:
+        selectors.append('*') # An empty selector selects everything.
+    return selectors

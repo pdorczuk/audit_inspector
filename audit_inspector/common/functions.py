@@ -7,7 +7,6 @@ from dateutil import parser
 from audit_inspector.common.settings import control_categories, header_font, dark_blue_fill
 from openpyxl.utils import get_column_letter
 
-
 def get_evidence_date(datestring):
     """
     Parse the output of the 'date' command and return as a datetime object.
@@ -36,10 +35,13 @@ def section_text_to_json(section):
 
 def traverse(o):
     if isinstance(o, list):
+        #print('level 1 is a list')
         for item in itertools.chain.from_iterable(o):
             if isinstance(item, dict):
+                #print('level 2 is a dict')
                 yield from dict_keys(item)
     elif isinstance(o, dict):
+        #print('level 1 is a dict')
         yield from dict_keys(o)
     else:
         yield item
@@ -50,11 +52,7 @@ def dict_keys(nested):
         if isinstance(value, abc.Mapping):
             yield from dict_keys(value)
         else:
-            try:
-                yield f"{key}={''.join(value)}"
-            except TypeError:
-                yield f"{key}={value}"
-
+            yield key,value
 
 def process_openssl_output(connectionDetails, platform, date, section_text, section_command):
     """

@@ -3,7 +3,7 @@ from tkinter import Tk, messagebox
 from tkinter.filedialog import askdirectory
 import os
 from pathlib import Path
-from audit_inspector.common import functions, settings, write_report
+from audit_inspector.common import functions, settings
 from audit_inspector.controls import connection, authorization, firewall, logging, patching
 from jinja2 import Environment, PackageLoader, FileSystemLoader
 from audit_inspector import controls
@@ -15,7 +15,6 @@ def main():
     evidence_dir = set_evidence_dir()
     for text in read_files(evidence_dir):
         results.extend(call_control_function(text))
-    write_report.main(results, evidence_dir)
 
 
 def set_evidence_dir():
